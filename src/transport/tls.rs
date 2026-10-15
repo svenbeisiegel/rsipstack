@@ -235,6 +235,10 @@ pub struct TlsConfig {
     pub ca_certs: Option<Vec<u8>>,
     // SNI hostname for TLS client connections (overrides the hostname derived from the remote address)
     pub sni_hostname: Option<String>,
+    // A ready client configuration for outgoing connections, e.g. with the
+    // platform's certificate verifier. When set, it is used as it is, and
+    // `ca_certs`, `client_cert` and `client_key` are ignored for them.
+    pub client_config: Option<Arc<ClientConfig>>,
 }
 
 fn parse_private_key(key_data: &[u8]) -> Result<pki_types::PrivateKeyDer<'static>> {
@@ -593,45 +597,61 @@ impl TlsConnection {
                 .await;
         }
 
-        let mut root_store = RootCertStore::empty();
-
-        // Load CA certificates if provided
-        if let Some(ca_data) = tls_config.and_then(|c| c.ca_certs.as_ref()) {
-            let certs = pki_types::CertificateDer::pem_slice_iter(ca_data.as_slice())
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| Error::Error(format!("Failed to parse CA certificates: {}", e)))?;
-            for cert in certs {
-                root_store
-                    .add(cert)
-                    .map_err(|e| Error::Error(format!("Failed to add CA certificate: {}", e)))?;
+        let client_config = match tls_config.and_then(|c| c.client_config.clone()) {
+            Some(client_config) => {
+                let mut client_config = Arc::unwrap_or_clone(client_config);
+                if let Some(verifier) = custom_verifier {
+                    client_config.dangerous().set_certificate_verifier(verifier);
+                }
+                client_config
             }
-        }
+            None => {
+                let mut root_store = RootCertStore::empty();
 
-        // Build client config with optional mutual TLS
-        let mut client_config = match (
-            tls_config.and_then(|c| c.client_cert.as_ref()),
-            tls_config.and_then(|c| c.client_key.as_ref()),
-        ) {
-            (Some(cert_data), Some(key_data)) => {
-                let certs = pki_types::CertificateDer::pem_slice_iter(cert_data.as_slice())
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|e| {
-                        Error::Error(format!("Failed to parse client certificate: {}", e))
-                    })?;
-                let key = parse_private_key(key_data)?;
-                ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_client_auth_cert(certs, key)
-                    .map_err(|e| Error::Error(format!("Client auth configuration error: {}", e)))?
+                // Load CA certificates if provided
+                if let Some(ca_data) = tls_config.and_then(|c| c.ca_certs.as_ref()) {
+                    let certs = pki_types::CertificateDer::pem_slice_iter(ca_data.as_slice())
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .map_err(|e| {
+                            Error::Error(format!("Failed to parse CA certificates: {}", e))
+                        })?;
+                    for cert in certs {
+                        root_store.add(cert).map_err(|e| {
+                            Error::Error(format!("Failed to add CA certificate: {}", e))
+                        })?;
+                    }
+                }
+
+                // Build client config with optional mutual TLS
+                let mut client_config = match (
+                    tls_config.and_then(|c| c.client_cert.as_ref()),
+                    tls_config.and_then(|c| c.client_key.as_ref()),
+                ) {
+                    (Some(cert_data), Some(key_data)) => {
+                        let certs = pki_types::CertificateDer::pem_slice_iter(cert_data.as_slice())
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                            .map_err(|e| {
+                                Error::Error(format!("Failed to parse client certificate: {}", e))
+                            })?;
+                        let key = parse_private_key(key_data)?;
+                        ClientConfig::builder()
+                            .with_root_certificates(root_store)
+                            .with_client_auth_cert(certs, key)
+                            .map_err(|e| {
+                                Error::Error(format!("Client auth configuration error: {}", e))
+                            })?
+                    }
+                    _ => ClientConfig::builder()
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth(),
+                };
+
+                if let Some(verifier) = custom_verifier {
+                    client_config.dangerous().set_certificate_verifier(verifier);
+                }
+                client_config
             }
-            _ => ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
         };
-
-        if let Some(verifier) = custom_verifier {
-            client_config.dangerous().set_certificate_verifier(verifier);
-        }
 
         // Prefer explicit SNI, otherwise use the remote host.
         let domain_string = tls_config
